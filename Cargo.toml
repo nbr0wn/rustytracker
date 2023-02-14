@@ -1,0 +1,9 @@
+[package]
+name = "rustytracker"
+version = "0.1.0"
+author = "Neil Brown"
+edition = "2021"
+
+[dependencies]
+opencv = "0.76.4"
+rand = "0.8.5"
