@@ -1,33 +1,44 @@
 use opencv::{highgui, Error, ml, types, imgcodecs, imgproc, core, features2d, prelude::*, videoio, Result};
 use std::time::Instant;
 use std::fs;
+use std::collections::HashMap;
+use std::process::Command;
 use rand::Rng;
+use clap::Parser;
+use regex::Regex;
 
-    /*
-	https://blog.devgenius.io/rust-and-opencv-bb0467bf35ff
-https://learnopencv.com/blob-detection-using-opencv-python-c/
-	pub struct SimpleBlobDetector_Params {
-		pub threshold_step: f32,
-		pub min_threshold: f32,
-		pub max_threshold: f32,
-		pub min_repeatability: size_t,
-		pub min_dist_between_blobs: f32,
-		pub filter_by_color: bool,
-		pub blob_color: u8,
-		pub filter_by_area: bool,
-		pub min_area: f32,
-		pub max_area: f32,
-		pub filter_by_circularity: bool,
-		pub min_circularity: f32,
-		pub max_circularity: f32,
-		pub filter_by_inertia: bool,
-		pub min_inertia_ratio: f32,
-		pub max_inertia_ratio: f32,
-		pub filter_by_convexity: bool,
-		pub min_convexity: f32,
-		pub max_convexity: f32,
-	}
-    */
+
+// This is the width and height of the model data.  Increaet it for
+// more accuracy but more processing power required
+const IMAGE_DIM:i32 = 20;
+
+// Contours smaller than this will be ignored
+const MIN_CONTOUR_AREA:f64 = 3.0;
+
+// These are the high and low ranges for the inRange threshold function.
+// Use the python tool in the tools directory to generate these values.
+const HSV_MIN_RANGE : &'static [i32] = &[78,139,111];
+const HSV_MAX_RANGE : &'static [i32] = &[114,255,255];
+
+#[derive(Parser, Default, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+   /// Path to training image and script directory
+   #[arg(short,long, default_value_t=("images".to_string()))]
+   image_dir: String,
+
+   /// Show tracking image windows
+   #[arg(short,long, default_value_t = false)]
+   show: bool,
+
+   /// When training, write new images here
+   #[arg(short='n',long, default_value_t=("new_images".to_string()))]
+   new_image_dir: String,
+
+   /// Training mode - save new images as they are detected
+   #[arg(short,long, default_value_t = false)]
+   train: bool,
+}
 
 fn scale_point( origin: &core::Point2f, pt: core::Point2f, scale: core::Point2f) -> core::Point2i {
 	let pt = core::Point2i::new(
@@ -37,13 +48,14 @@ fn scale_point( origin: &core::Point2f, pt: core::Point2f, scale: core::Point2f)
 
 	pt
 }
-const IMAGE_DIM:i32 = 20;
-const MIN_CONTOUR_AREA:f64 = 3.0;
 
+fn check_glyph( knn: &core::Ptr<dyn KNearest>, keypoints : &core::Vector<core::KeyPoint>, 
+	args: &Args ) -> Result<u32> {
 
-fn check_glyph( knn: &core::Ptr<dyn KNearest>, keypoints : &core::Vector<core::KeyPoint> ) -> Result<()> {
-
-	if keypoints.len() < 3 { return Err(Error{code:0, message:"Not enough points".to_string()}); }
+	// Make sure we have enough points to make at least one line
+	if keypoints.len() < 2 { 
+		return Err(Error{code:0, message:"Not enough points".to_string()}); 
+	}
 
 	// Create a 32x32 image - man these rust opencv bindings are annoying
 	// Maybe there's a better way to do this but I couldn't find it
@@ -91,21 +103,25 @@ fn check_glyph( knn: &core::Ptr<dyn KNearest>, keypoints : &core::Vector<core::K
 
 	knn.find_nearest(&mut sample, 1, &mut result_idx, &mut neighbors, &mut dist).unwrap();
 
-	// Write the training image to disk
-	let flags : core::Vector<i32> = core::Vector::default();
-	let mut rng = rand::thread_rng();
-	let val = rng.gen::<u32>();
-	imgcodecs::imwrite(format!("train_images/{}.png",val).as_str(), &dest_image, &flags);
+	if args.train {
+		// Write the training image to disk
+		let flags : core::Vector<i32> = core::Vector::default();
+		let mut rng = rand::thread_rng();
+		let val = rng.gen::<u32>();
+		imgcodecs::imwrite(format!("{}/{}.png",args.new_image_dir, val).as_str(), 
+			&dest_image, &flags).unwrap();
+	}
 
 	let res: f32 = *result_idx.at(0).unwrap();
-	println!("RESULT:{}", res);
 
-	// Draw the glyph 
-	let window = "glyph";
-	highgui::named_window(window, highgui::WINDOW_AUTOSIZE).unwrap();
-	highgui::imshow(window, &dest_image).unwrap();
+	if args.show {
+		// Draw the glyph 
+		let window = "glyph";
+		highgui::named_window(window, highgui::WINDOW_AUTOSIZE).unwrap();
+		highgui::imshow(window, &dest_image).unwrap();
+	}
 
-	Ok(())
+	Ok(res as u32)
 }
 
 // Convert an image to the proper format for our model
@@ -116,45 +132,62 @@ fn img_to_sample(img: &Mat) -> opencv::prelude::Mat  {
 	output.reshape(0, 1).unwrap()
 }
 
-fn build_model( ) -> core::Ptr<dyn KNearest> {
+// Train our KNN model with images in the image directory.  Use the 
+// directory names 
+fn build_model( args: &Args ) -> (core::Ptr<dyn KNearest>, HashMap<u32,String>) {
 
 	// Our training data and labels
 	let mut sample_set = core::Mat::default();
 	let mut label_set = core::Mat::default();
 
+	let mut label_hash: HashMap<u32,String> = HashMap::new();
+
 	// Create the KNearest model
 	let mut knn = <dyn ml::KNearest>::create().unwrap();
 
-	let dir = "images";
-
 	let mut glyph_index = 0;
 
-	// Iterate over the glyph image directories
-	for glyph_dir in fs::read_dir(dir).unwrap() {
-		let glyph_dir = glyph_dir.unwrap();
+	// Iterate over the glyph image directories in sorted order
+	let mut training_paths : Vec<_> = fs::read_dir(args.image_dir.clone()).unwrap().map( 
+		|dir| dir.unwrap()).collect();
+
+	let re = Regex::new(r".*/").unwrap();
+	// Iterate over the directories
+	for glyph_dir in training_paths {
 		let glyph_path = glyph_dir.path();
-		println!("GLYPH INDEX {} is {:?}", glyph_index, glyph_path);
 		if glyph_path.is_dir() {
+		
+			// Add the label to our glpyh id hash
+			let path_str : &str = glyph_path.to_str().unwrap();
+			let glyph_name = re.replace(path_str, "".to_string()).into_owned();
+			println!("GLYPH INDEX {} is {:?}", glyph_index, glyph_name);
+			label_hash.insert(glyph_index, glyph_name);
 			// Loop through the images in the directory for this glyph
 			for glyph_file in fs::read_dir(glyph_path).unwrap() {
 				let labelidx = Mat::from_slice(&[glyph_index as f32]).unwrap();
 				let glyph_file = glyph_file.unwrap();
-				let img = imgcodecs::imread(glyph_file.path().to_str().unwrap(),imgcodecs::IMREAD_GRAYSCALE).unwrap();
+				let img = imgcodecs::imread(glyph_file.path().to_str().unwrap(),
+					imgcodecs::IMREAD_GRAYSCALE).unwrap();
 				let sample = img_to_sample(&img);
 				sample_set.push_back(&sample).unwrap();
 				label_set.push_back(&labelidx).unwrap();
 			}
+
+			glyph_index += 1;
 		}
-		glyph_index += 1;
 	}
 
 	// Train the model with our sample set
 	knn.train( &sample_set, ml::ROW_SAMPLE, &label_set ).unwrap();
 
-	knn
+	// Return the goodies
+	(knn,label_hash)
 }
 
+// Given a bounding box, update its bounds to include the new point.  Discard any
+// new point that is within a threshold of the center
 fn update_bounds( bounds: &mut core::Rect, pt_x: i32, pt_y: i32, threshold: i32 ) {
+
 	// First off make sure the new point is within threshold distance of the current center
 	if (pt_x - (bounds.x + bounds.width / 2) > threshold)
 	|| (pt_y - (bounds.y + bounds.height / 2) > threshold)  {
@@ -185,50 +218,37 @@ fn update_bounds( bounds: &mut core::Rect, pt_x: i32, pt_y: i32, threshold: i32 
 }
 
 fn main() -> Result<()> {
+
+	let args = Args::parse();
+
 	let window = "video capture";
 	highgui::named_window(window, highgui::WINDOW_AUTOSIZE)?;
 
-	let knn = build_model();
+	let mut cam = match videoio::VideoCapture::new(0, videoio::CAP_ANY) {
+		Ok(cam) => cam,
+		Err(e) => { println!("Error Opening Camera: {}", e); return Err(e);  }
+	};
 
-	let mut cam = videoio::VideoCapture::new(0, videoio::CAP_ANY)?; // 0 is the default camera
+	if let Err(e) = videoio::VideoCapture::is_opened(&cam) {
+		println!("Error Opening Camera{}", e);
+		return Err(e);
+	}
+
     cam.set(videoio::CAP_PROP_FRAME_WIDTH, 320.0).unwrap();
     cam.set(videoio::CAP_PROP_FRAME_HEIGHT, 240.0).unwrap();
 
-	let opened = videoio::VideoCapture::is_opened(&cam)?;
-	if !opened {
-		panic!("Unable to open default camera!");
-	}
 
-	//let mut all_contours = types::VectorOfMat::new(); 
+	// Build the model and get the glyph labels
+	let (knn,labels) = build_model(&args);
 
 	let mut all_keypoints : core::Vector<core::KeyPoint> = core::Vector::default();
 
 	let mut quiet_start = Instant::now();
 
-	/* 
-	let mut bd_params : features2d::SimpleBlobDetector_Params = 
-		features2d::SimpleBlobDetector_Params::default().unwrap();
-	//bd_params.threshold_step = 2.0;
-	//bd_params.min_threshold = 200.0;
-	//bd_params.max_threshold = 255.0;
-	bd_params.min_dist_between_blobs = 100.0;
-	bd_params.filter_by_color = true;
-	bd_params.blob_color = 255;
-	//bd_params.filter_by_inertia = false;
-	bd_params.filter_by_circularity = false;
-	//bd_params.min_circularity = 0.05;
-	bd_params.filter_by_convexity = false;
-	bd_params.filter_by_area = true;
-	bd_params.min_area = 15.0;
-	let mut bd  = features2d::SimpleBlobDetector::create(bd_params).unwrap();
-	*/
-
-//   let mut detector = core::SparsePyrLKOpticalFlow::create(
-//	core::Size(21,21),
-// 		3,
-//	TermCriteria(TermCriteria::COUNT + TermCriteria::EPS, 30, 0.01),
-//	0, 
-//	1e-4);
+	// If we're training, create the new image dir
+	if args.train {
+		fs::create_dir_all(format!("{}",args.new_image_dir)).unwrap();
+	}
 
 	loop {
 		//let frame_start = Instant::now();
@@ -239,8 +259,8 @@ fn main() -> Result<()> {
 		let mut dest_image = Mat::default();
 
 		// HSV color range for threshold
-		let lower_bound = Mat::from_slice(&[78,139,111]).unwrap();
-		let upper_bound = Mat::from_slice(&[114,255,255]).unwrap();
+		let lower_bound = Mat::from_slice(&HSV_MIN_RANGE).unwrap();
+		let upper_bound = Mat::from_slice(&HSV_MAX_RANGE).unwrap();
 
 		// Grab a frame from the camera
 		cam.read(&mut frame)?;
@@ -254,8 +274,8 @@ fn main() -> Result<()> {
 			// Do color thresholding
 			core::in_range(&hsv, &lower_bound, &upper_bound, &mut thresh).unwrap();
 
+			// Blur the threshold image
 			//let mut intermediate = Mat::default();
-			// Blur the intermediate image
 			//imgproc::blur(&intermediate, &mut thresh, core::Size::new(7,7), core::Point::new(-1,-1), 0).unwrap();
 
 			// Find contours in the thresholded image
@@ -272,6 +292,7 @@ fn main() -> Result<()> {
 			// Get rid of any contours that are too small
 			let contours : types::VectorOfMat = found_contours.iter().take_while(
 				|c| imgproc::contour_area(&c, false).unwrap() > MIN_CONTOUR_AREA).collect();
+
 
 			if contours.len() > 0 {
 				quiet_start = Instant::now();
@@ -300,65 +321,18 @@ fn main() -> Result<()> {
 				// Add our keypoint to the list of keypoints
 				all_keypoints.push(kp);
 
-/*
-				// Add our contour to the list of contours
-				all_contours.extend(contours);
-
-				let hierarchy = Mat::default();
-				let offset = core::Point::new(0, 0);
-
-				// Draw the contours
-				for c in 0..all_contours.len() {
-					imgproc::draw_contours(
-						&mut frame, 
-						&all_contours, 
-						c as i32,
-						core::VecN([0.0, 255.0, 255.0, 0.0]),
-						-1,
-						1,
-						&hierarchy,
-						0,
-						offset
-					).unwrap();
-				}
-*/
 			} else {
 				// remove all points if no contours are detected for awhile
 				if quiet_start.elapsed().as_millis() > 500 {
 					// Done drawing.  Check the image and clear the points.
-					//all_contours.clear();
-					let _result = check_glyph(&knn, &all_keypoints);
+					if let Ok(result) = check_glyph(&knn, &all_keypoints, &args) {
+						println!("Glyph: {:?}", labels[&result]);
+						let _ = Command::new(format!("{}/{}.sh",args.image_dir,labels[&result]))
+						.output();
+					}
 					all_keypoints.clear();
 				}
 			}
-
-/*
-            // Detect the blobs
-            let mut keypoints : core::Vector<core::KeyPoint> = core::Vector::default();
-			let mask = core::no_array();
-            let _ = bd.detect(&thresh, &mut keypoints, &mask);
-
-			// remove all points if no blobs are detected for awhile
-			if keypoints.len() == 0 {
-				if quiet_start.elapsed().as_millis() > 500 {
-					// Done drawing.  Check the image and clear the points.
-					all_keypoints.clear();
-					all_contours.clear();
-				}
-			}
-			else {
-				quiet_start = Instant::now();
-			}
-
-			for pt in &keypoints {
-				print!("{} ", pt.size())
-			}
-			println!("");
-
-			//all_keypoints.extend(keypoints);
-
-*/
-
 
 			// Get the bounds of the last few blobs and see if the source is not moving
 			let check_range:usize = 10;
@@ -385,8 +359,11 @@ fn main() -> Result<()> {
 				let area = (max_x - min_x) * (max_y - min_y);
 				if area < 100.0 {
 					// Stopped.  Check the image and clear the points
-					//all_contours.clear();
-					let _result = check_glyph(&knn, &all_keypoints);
+					if let Ok(result) = check_glyph(&knn, &all_keypoints, &args) {
+						println!("Glyph: {:?}", labels[&result]);
+						let _ = Command::new(format!("{}/{}.sh",args.image_dir,labels[&result]))
+						.output();
+					}
 					all_keypoints.clear();
 				}
 			}
@@ -419,21 +396,15 @@ fn main() -> Result<()> {
 				core::VecN([0.0, 255.0, 255.0, 0.0]), 2, 0, 0)?;
 			}
 
-            // Render them
-            //for keypt in keypoints {
-                //println!("{},{}", keypt.pt().x, keypt.pt().y);
-            //}
-            //imgproc::rectangle(&frame,
-                //core::Rect::from_points(core::Point::new(0,0),core::Point::new(50,50)),
-                //core::VecN([255.0,0.0,0.0,0.0]),
-                //-1,
-                //imgproc::LINE_8,
-                //0);
-			highgui::imshow(window, &dest_image)?;
+			if args.show {
+				highgui::imshow(window, &dest_image)?;
+			}
 		}
-		let key = highgui::wait_key(100)?;
-		if key > 0 && key != 255 {
-			break;
+		if args.show {
+			let key = highgui::wait_key(100)?;
+			if key > 0 && key != 255 {
+				break;
+			}
 		}
 		//println!("F:{}",frame_start.elapsed().as_millis());
 	}
