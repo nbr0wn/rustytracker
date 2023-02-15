@@ -5,5 +5,7 @@ author = "Neil Brown"
 edition = "2021"
 
 [dependencies]
+clap = { version = "4.1.4", features = ["derive"] }
 opencv = "0.76.4"
 rand = "0.8.5"
+regex = "1.7.1"
