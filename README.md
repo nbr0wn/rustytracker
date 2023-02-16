@@ -52,10 +52,10 @@ execute when the glyph is detected.
 
 Rustytracker isolates the item of interest and then uses the KNearest ml algorithm from openCV to detect glyphs.  
 - Grab a frame from the webcam
-- Convert frame to HSV
-- Use thresholding to isolate the color of interest
+- Convert frame to HSV color space
+- Use HSV thresholding to isolate the color of interest
 - Use opencv's contour detector to detect contours in the image
-- Take the center of each contour as a point in a connected of glpyh line segments
+- Take the center of each contour as a point in a connected list of glpyh line segments
 - Stop detecting points when a frame is detected with no contours or when the last n contours detected are within some small bounds (object not moving)
 - Determine scale factor to fit points into sample image size
 - Draw connected points as lines into blank sample image
