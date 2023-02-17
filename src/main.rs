@@ -1,4 +1,5 @@
 use opencv::{highgui, Error, ml, types, imgcodecs, imgproc, core, features2d, prelude::*, videoio, Result};
+use std::sync::Arc;
 use std::time::Instant;
 use std::fs;
 use std::collections::HashMap;
@@ -20,6 +21,17 @@ const MIN_CONTOUR_AREA:f64 = 3.0;
 const HSV_MIN_RANGE : &'static [i32] = &[78,139,111];
 const HSV_MAX_RANGE : &'static [i32] = &[114,255,255];
 
+// When checking for whether or not motion has stopped, this is 
+// how many recent points to consider and how small the motion
+// should be
+const MOTION_STOPPED_WINDOW:usize = 10;
+const MOTION_STOPPED_AREA:i32 = 100;
+
+// When checking for whether or not motion has stopped, this is 
+// how many milliseconds to consider
+const MOTION_STOPPED_MS:u128 = 1000;
+
+// Command line argument definitions
 #[derive(Parser, Default, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -28,7 +40,7 @@ struct Args {
    image_dir: String,
 
    /// Show tracking image windows
-   #[arg(short,long, default_value_t = false)]
+   #[arg(short,long, default_value_t = true)]
    show: bool,
 
    /// When training, write new images here
@@ -38,18 +50,26 @@ struct Args {
    /// Training mode - save new images as they are detected
    #[arg(short,long, default_value_t = false)]
    train: bool,
+
+   /// Use grayscale thresholding for detection
+   #[arg(short,long, default_value_t = false)]
+   grayscale: bool,
+
+   /// Show fps
+   #[arg(short,long, default_value_t = true)]
+   fps: bool,
 }
 
-fn scale_point( origin: &core::Point2f, pt: core::Point2f, scale: core::Point2f) -> core::Point2i {
-	let pt = core::Point2i::new(
-		((pt.x - origin.x) * scale.x) as i32,
-		((pt.y - origin.y) * scale.y) as i32
-	);
-
-	pt
+// Apply a scale factor to a point
+fn scale_point( origin: &core::Point, pt: core::Point, scale: core::Point2f) -> core::Point {
+	core::Point::new(
+		((pt.x - origin.x) as f32 * scale.x) as i32,
+		((pt.y - origin.y) as f32 * scale.y) as i32
+	)
 }
 
-fn check_glyph( knn: &core::Ptr<dyn KNearest>, keypoints : &core::Vector<core::KeyPoint>, 
+// Check a sample image against the trained KNearest model
+fn check_glyph( knn: &core::Ptr<dyn KNearest>, keypoints : &core::Vector<core::Point>, 
 	args: &Args ) -> Result<u32> {
 
 	// Make sure we have enough points to make at least one line
@@ -64,11 +84,11 @@ fn check_glyph( knn: &core::Ptr<dyn KNearest>, keypoints : &core::Vector<core::K
 
 	// Find the bounds of the keypoints
 	// Start with a 1x1 bounding box 
-	let pt = keypoints.get(0).unwrap().pt();
+	let pt = keypoints.get(0).unwrap();
 	let mut bbox = core::Rect::new(pt.x as i32, pt.y as i32, 1, 1);
 	for idx in 1..keypoints.len() {
-		let kp = keypoints.get(idx).unwrap().pt();
-		update_bounds(&mut bbox, kp.x as i32, kp.y as i32, 9999);
+		let kp = keypoints.get(idx).unwrap();
+		update_bounds(&mut bbox, &kp, 9999);
 	}
 
 	// Figure out the scale factor to draw everything within bounds
@@ -82,12 +102,12 @@ fn check_glyph( knn: &core::Ptr<dyn KNearest>, keypoints : &core::Vector<core::K
 	let scale_factor : core::Point2f = core::Point2f::new( x_scale, y_scale );
 	
 	// Get the top left corner of the bounding box
-	let origin : core::Point2f = core::Point2f::new( bbox.x as f32, bbox.y as f32 );
+	let origin = core::Point::new( bbox.x, bbox.y);
 
 	// Draw line segments between keypoints into the image 
-	let mut pt1 = scale_point(&origin, keypoints.get(0)?.pt(), scale_factor);
+	let mut pt1 = scale_point(&origin, keypoints.get(0).unwrap(), scale_factor);
 	for keypt in keypoints.iter().skip(1) {
-		let pt2 = scale_point(&origin, keypt.pt(), scale_factor);
+		let pt2 = scale_point(&origin, keypt, scale_factor);
 		
 		imgproc::line(&mut dest_image, pt1, pt2, 
 			core::VecN([255.0, 255.0, 255.0, 1.0]), 2, 0, 0).unwrap();
@@ -116,9 +136,7 @@ fn check_glyph( knn: &core::Ptr<dyn KNearest>, keypoints : &core::Vector<core::K
 
 	if args.show {
 		// Draw the glyph 
-		let window = "glyph";
-		highgui::named_window(window, highgui::WINDOW_AUTOSIZE).unwrap();
-		highgui::imshow(window, &dest_image).unwrap();
+		highgui::imshow("sample", &dest_image).unwrap();
 	}
 
 	Ok(res as u32)
@@ -148,7 +166,7 @@ fn build_model( args: &Args ) -> (core::Ptr<dyn KNearest>, HashMap<u32,String>) 
 	let mut glyph_index = 0;
 
 	// Iterate over the glyph image directories in sorted order
-	let mut training_paths : Vec<_> = fs::read_dir(args.image_dir.clone()).unwrap().map( 
+	let training_paths : Vec<_> = fs::read_dir(args.image_dir.clone()).unwrap().map( 
 		|dir| dir.unwrap()).collect();
 
 	let re = Regex::new(r".*/").unwrap();
@@ -186,43 +204,119 @@ fn build_model( args: &Args ) -> (core::Ptr<dyn KNearest>, HashMap<u32,String>) 
 
 // Given a bounding box, update its bounds to include the new point.  Discard any
 // new point that is within a threshold of the center
-fn update_bounds( bounds: &mut core::Rect, pt_x: i32, pt_y: i32, threshold: i32 ) {
+fn update_bounds( bounds: &mut core::Rect, pt: &core::Point, threshold: i32 ) {
 
 	// First off make sure the new point is within threshold distance of the current center
-	if (pt_x - (bounds.x + bounds.width / 2) > threshold)
-	|| (pt_y - (bounds.y + bounds.height / 2) > threshold)  {
+	if (pt.x - (bounds.x + bounds.width / 2) > threshold)
+	|| (pt.y - (bounds.y + bounds.height / 2) > threshold)  {
 		// Too far - don't update
 		return;
 	}
 
 	// Now adjust the bounding box to include the new point
-	if pt_x < bounds.x {
-		let diff = bounds.x - pt_x;
-		bounds.x = pt_x ;
+	if pt.x < bounds.x {
+		let diff = bounds.x - pt.x;
+		bounds.x = pt.x ;
 		bounds.width += diff;
 	}
 
-	if pt_y < bounds.y {
-		let diff = bounds.y - pt_y;
-		bounds.y = pt_y;
+	if pt.y < bounds.y {
+		let diff = bounds.y - pt.y;
+		bounds.y = pt.y;
 		bounds.height += diff;
 	}
 
-	if pt_x > bounds.x + bounds.width {
-		bounds.width = pt_x - bounds.x;
+	if pt.x > bounds.x + bounds.width {
+		bounds.width = pt.x - bounds.x;
 	}
 
-	if pt_y > bounds.y + bounds.height {
-		bounds.height = pt_y - bounds.y;
+	if pt.y > bounds.y + bounds.height {
+		bounds.height = pt.y - bounds.y;
 	}
+}
+
+
+// Convenience function for center of a rectangle
+fn get_center( rect: &core::Rect ) -> core::Point {
+	core::Point { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2}
+}
+
+// Return the center point of the largest contour
+fn get_max_contour_center( contours: &types::VectorOfMat ) -> Option<core::Point> {
+	let mut max_area = MIN_CONTOUR_AREA;
+	let mut found = false;
+	let mut bounds: core::Rect = core::Rect::default();
+	for c in contours.iter() {
+		// TODO - maybe sufficient and faster to get the bounding rect first and check its area
+		let a = imgproc::contour_area(&c,false).unwrap();
+		if a > max_area {
+			found = true;
+			max_area = a;
+			bounds = imgproc::bounding_rect(&c).unwrap();
+		}
+	}
+
+	if found {
+		return Some(get_center(&bounds));
+	}
+
+	None
+}
+
+fn draw_glyph(dest_image: &mut core::Mat, points : &core::Vector<core::Point>) {
+
+	// Don't bother if we don't have enough points
+	if points.len() < 2 {
+		return;
+	}
+
+	// Draw the keypoints with connected line segments
+	let mut prev_pt = points.get(0).unwrap();
+	imgproc::draw_marker(dest_image, prev_pt, 
+			core::VecN([0.0, 0.0, 255.0, 1.0]),
+			imgproc::MARKER_DIAMOND,
+			10,
+			2,
+			imgproc::FILLED).unwrap();
+	for keypt in points.iter().skip(1) {
+		imgproc::draw_marker(dest_image, keypt, 
+				core::VecN([0.0, 0.0, 255.0, 1.0]),
+				imgproc::MARKER_DIAMOND,
+				10,
+				2,
+				imgproc::FILLED).unwrap();
+		imgproc::line(dest_image, prev_pt, keypt, 
+			core::VecN([0.0, 255.0, 255.0, 1.0]), 2, 0, 0).unwrap();
+
+		prev_pt = keypt;
+	}
+
+	let pt = points.get(0).unwrap();
+	let mut bbox = core::Rect::new(pt.x as i32, pt.y as i32, 1, 1);
+	for idx in 1..points.len() {
+		let kp = points.get(idx).unwrap();
+		update_bounds(&mut bbox, &kp, 9999);
+	}
+
+	imgproc::rectangle(dest_image, bbox,
+		core::VecN([0.0, 255.0, 255.0, 1.0]), 2, 0, 0).unwrap();
 }
 
 fn main() -> Result<()> {
 
 	let args = Args::parse();
 
-	let window = "video capture";
-	highgui::named_window(window, highgui::WINDOW_AUTOSIZE)?;
+	let cam_win = "frame";
+	highgui::named_window(cam_win, highgui::WINDOW_AUTOSIZE)?;
+
+	let thresh_win = "threshold";
+	highgui::named_window(thresh_win, highgui::WINDOW_AUTOSIZE)?;
+
+	let glyph_win = "glyph";
+	highgui::named_window(glyph_win, highgui::WINDOW_AUTOSIZE)?;
+
+	let sample_win = "sample";
+	highgui::named_window(sample_win, highgui::WINDOW_AUTOSIZE)?;
 
 	let mut cam = match videoio::VideoCapture::new(0, videoio::CAP_ANY) {
 		Ok(cam) => cam,
@@ -241,7 +335,7 @@ fn main() -> Result<()> {
 	// Build the model and get the glyph labels
 	let (knn,labels) = build_model(&args);
 
-	let mut all_keypoints : core::Vector<core::KeyPoint> = core::Vector::default();
+	let mut all_keypoints : core::Vector<core::Point> = core::Vector::default();
 
 	let mut quiet_start = Instant::now();
 
@@ -250,163 +344,139 @@ fn main() -> Result<()> {
 		fs::create_dir_all(format!("{}",args.new_image_dir)).unwrap();
 	}
 
+	let mut frame = Mat::default();
+	let mut gray = Mat::default();
+	let mut thresh = Mat::default();
+	let mut frame_count = 0;
+	let mut frame_start = Instant::now();
+	let zeros = Mat::zeros(320, 320,core::CV_8UC3).unwrap();
+	let mut glyph_image : core::Mat = zeros.to_mat().unwrap();
+
+	// HSV color range for threshold
+	let mut hsv = Mat::default();
+	let lower_bound = Mat::from_slice(&HSV_MIN_RANGE).unwrap();
+	let upper_bound = Mat::from_slice(&HSV_MAX_RANGE).unwrap();
+
 	loop {
-		//let frame_start = Instant::now();
+		let mut do_glyph_check: bool = false;
 
-		let mut frame = Mat::default();
-		let mut hsv = Mat::default();
-		let mut thresh = Mat::default();
-		let mut dest_image = Mat::default();
-
-		// HSV color range for threshold
-		let lower_bound = Mat::from_slice(&HSV_MIN_RANGE).unwrap();
-		let upper_bound = Mat::from_slice(&HSV_MAX_RANGE).unwrap();
+		if args.fps {
+			if frame_count == 0 {
+				frame_start = Instant::now();
+			}
+			frame_count += 1;
+		}
 
 		// Grab a frame from the camera
 		cam.read(&mut frame)?;
 
-		// Process it if it's real
-		if frame.size()?.width > 0 {
+		// If we didn't get a frame, try for another
+		if frame.size()?.width <= 0 {
+			continue;
+		}
 
+		if args.grayscale {
+			// Convert to gray scale
+			imgproc::cvt_color(&frame, &mut gray, imgproc::COLOR_BGR2GRAY, 0).unwrap();
+
+			// Do binary thresholding on the gray image
+			imgproc::threshold(&gray, &mut thresh, 100.0, 255.0, imgproc::THRESH_BINARY).unwrap();
+		} else {
 			// Convert frame to hsv
 			imgproc::cvt_color(&frame, &mut hsv, imgproc::COLOR_BGR2HSV, 0).unwrap();
 
 			// Do color thresholding
 			core::in_range(&hsv, &lower_bound, &upper_bound, &mut thresh).unwrap();
+		}
 
-			// Blur the threshold image
-			//let mut intermediate = Mat::default();
-			//imgproc::blur(&intermediate, &mut thresh, core::Size::new(7,7), core::Point::new(-1,-1), 0).unwrap();
+		// Blur the threshold image - sometimes this is helpful for noisy images
+		//let mut intermediate = Mat::default();
+		//imgproc::blur(&intermediate, &mut thresh, core::Size::new(7,7), core::Point::new(-1,-1), 0).unwrap();
 
-			// Find contours in the thresholded image
-			let zero_offset = core::Point::new(0, 0);
-			let mut found_contours = types::VectorOfMat::new(); 
-			imgproc::find_contours(
-				&mut thresh, 
-				&mut found_contours, 
-				3, 
-				1, 
-				zero_offset
-			)?;
+		// Find contours in the thresholded image
+		let mut found_contours = types::VectorOfMat::new(); 
+		imgproc::find_contours(
+			&mut thresh, 
+			&mut found_contours, 
+			imgproc::RETR_EXTERNAL,  // Only the external contours
+			imgproc::CHAIN_APPROX_SIMPLE,  // Only the bounds are stored
+			core::Point::new(0,0)
+		)?;
 
-			// Get rid of any contours that are too small
-			let contours : types::VectorOfMat = found_contours.iter().take_while(
-				|c| imgproc::contour_area(&c, false).unwrap() > MIN_CONTOUR_AREA).collect();
+		// Get the center of the largest contour if there is one
+		if let Some(center_point) = get_max_contour_center(&found_contours) {
+			// Add our keypoint to the list of keypoints
+			all_keypoints.push(center_point);
+			quiet_start = Instant::now();
 
-
-			if contours.len() > 0 {
-				quiet_start = Instant::now();
-
-				// Build the initial bounding box from the first contour
-				let mut bounds = imgproc::bounding_rect(&contours.get(0)?)?;
-
-				// Update the bounding box with the points from the rest of the contours
-				for c in 1..contours.len() {
-					let bbox = imgproc::bounding_rect(&contours.get(c)?)?;
-					update_bounds( &mut bounds, bbox.x,            bbox.y,             30);
-					update_bounds( &mut bounds, bbox.x+bbox.width, bbox.y+bbox.height, 30);
-				}
-
-				// Build the center point from our contour bounding box
-				let pt = core::Point2f::new((bounds.x + bounds.width / 2) as f32, (bounds.y + bounds.height / 2) as f32);
-
-				// Make a keypoint from the center point
-				let kp = core::KeyPoint::new_point(pt,
-					10.0,
-					0.0,
-					0.0,
-					0,
-					0 )?;
-
-				// Add our keypoint to the list of keypoints
-				all_keypoints.push(kp);
-
-			} else {
-				// remove all points if no contours are detected for awhile
-				if quiet_start.elapsed().as_millis() > 500 {
-					// Done drawing.  Check the image and clear the points.
-					if let Ok(result) = check_glyph(&knn, &all_keypoints, &args) {
-						println!("Glyph: {:?}", labels[&result]);
-						let _ = Command::new(format!("{}/{}.sh",args.image_dir,labels[&result]))
-						.output();
-					}
-					all_keypoints.clear();
-				}
-			}
-
-			// Get the bounds of the last few blobs and see if the source is not moving
-			let check_range:usize = 10;
-			if all_keypoints.len()  > check_range {
-				let mut min_x : f32 = 9999.0;
-				let mut min_y : f32 = 9999.0;
-				let mut max_x : f32 = 0.0;
-				let mut max_y : f32 = 0.0;
-				for (_idx, keypt) in all_keypoints.iter().skip(all_keypoints.len()-check_range).enumerate() {
-					let pt = keypt.pt();
-					if pt.x < min_x {
-						min_x = pt.x;
-					}
-					if pt.y < min_y {
-						min_y = pt.y;
-					}
-					if pt.x > max_x {
-						max_x = pt.x;
-					}
-					if pt.y > max_y {
-						max_y = pt.y;
-					}
-				}
-				let area = (max_x - min_x) * (max_y - min_y);
-				if area < 100.0 {
-					// Stopped.  Check the image and clear the points
-					if let Ok(result) = check_glyph(&knn, &all_keypoints, &args) {
-						println!("Glyph: {:?}", labels[&result]);
-						let _ = Command::new(format!("{}/{}.sh",args.image_dir,labels[&result]))
-						.output();
-					}
-					all_keypoints.clear();
-				}
-			}
-            
-			// Plot the blobs
-			let _ = features2d::draw_keypoints(&thresh, &all_keypoints, &mut dest_image, 
-                core::VecN([0.0, 0.0, 255.0, 0.0]),
-				features2d::DrawMatchesFlags::DEFAULT);
-
-			// Draw line segments between keypoints
-			if all_keypoints.len() > 2 {
-				let mut pt1 = all_keypoints.get(0)?.pt();
-				for keypt in all_keypoints.iter().skip(1) {
-					let pt2 = keypt.pt();
-					let pt2_u32 = core::Point2i {x:pt2.x as i32, y:pt2.y as i32};
-					let pt1_u32 = core::Point2i {x:pt1.x as i32, y:pt1.y as i32};
-					imgproc::line(&mut dest_image, pt1_u32, pt2_u32, 
-						core::VecN([0.0, 255.0, 255.0, 0.0]), 2, 0, 0)?;
-
-					pt1 = pt2;
-				}
-
-			let pt = all_keypoints.get(0).unwrap().pt();
-			let mut bbox = core::Rect::new(pt.x as i32, pt.y as i32, 1, 1);
-			for idx in 1..all_keypoints.len() {
-				let kp = all_keypoints.get(idx).unwrap().pt();
-				update_bounds(&mut bbox, kp.x as i32, kp.y as i32, 9999);
-			}
-			imgproc::rectangle(&mut dest_image, bbox,
-				core::VecN([0.0, 255.0, 255.0, 0.0]), 2, 0, 0)?;
-			}
-
-			if args.show {
-				highgui::imshow(window, &dest_image)?;
+		} else {
+			// If we haven't seen a point for awhile, attempt a match
+			if quiet_start.elapsed().as_millis() > MOTION_STOPPED_MS && all_keypoints.len() > 2 {
+				println!("No More Points");
+				do_glyph_check = true;
 			}
 		}
+
+		// Get the bounds of the last few points and see if the source is not moving
+		// No need to do this if we already decided that we need to do a glyph check
+		if all_keypoints.len()  > 2 && !do_glyph_check {
+			// We'll use the first point as our bounds start
+			let mut skip: usize =1;
+
+			// Figure out how points we need to skip
+			if all_keypoints.len() > MOTION_STOPPED_WINDOW {
+				skip = all_keypoints.len() - MOTION_STOPPED_WINDOW + 1;
+			} 
+
+			// Init our bounds with the first keypoint
+			let kp = all_keypoints.get(skip-1).unwrap();
+			let mut bounds = core::Rect::new(kp.x, kp.y, 1, 1);
+
+			// Calculate bounding box for the points
+			for (_idx, keypt) in all_keypoints.iter().skip(skip).enumerate() {
+				update_bounds(&mut bounds, &keypt, 9999);
+			}
+
+			// Check area
+			if all_keypoints.len() > 10 && bounds.area() < MOTION_STOPPED_AREA {
+				println!("Area: {}", bounds.area());
+				println!("Not enough motion");
+				do_glyph_check = true;
+			}
+		}
+
+		// Show our windows if requested
 		if args.show {
-			let key = highgui::wait_key(100)?;
+			glyph_image = zeros.to_mat().unwrap();
+			draw_glyph(&mut glyph_image, &all_keypoints);
+
+			highgui::imshow(cam_win, &frame).unwrap();
+			highgui::imshow(thresh_win, &thresh).unwrap();
+			highgui::imshow(glyph_win, &glyph_image).unwrap();
+
+			let key = highgui::wait_key(1).unwrap();
 			if key > 0 && key != 255 {
-				break;
+				return Ok(());
 			}
 		}
-		//println!("F:{}",frame_start.elapsed().as_millis());
+
+		// Time to run our glyph through the model?
+		if do_glyph_check {
+			// Stopped.  Check the image and clear the points
+			if let Ok(result) = check_glyph(&knn, &all_keypoints, &args) {
+				println!("Glyph: {:?}", labels[&result]);
+				let _ = Command::new(format!("{}/{}.sh",args.image_dir,labels[&result]))
+				.output();
+			}
+			all_keypoints.clear();
+		}
+
+		// Handle fps 
+		if args.fps {
+			if frame_count == 100 {
+				println!("FPS:{}",frame_start.elapsed().as_millis() / 100);
+				frame_count = 0;
+			}
+		}
 	}
-	Ok(())
 }
