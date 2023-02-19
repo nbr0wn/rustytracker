@@ -1,5 +1,4 @@
-use opencv::{highgui, Error, ml, types, imgcodecs, imgproc, core, features2d, prelude::*, videoio, Result};
-use std::sync::Arc;
+use opencv::{highgui, Error, ml, types, imgcodecs, imgproc, core, prelude::*, videoio, Result};
 use std::time::Instant;
 use std::fs;
 use std::collections::HashMap;
@@ -20,6 +19,9 @@ const MIN_CONTOUR_AREA:f64 = 3.0;
 // Use the python tool in the tools directory to generate these values.
 const HSV_MIN_RANGE : &'static [i32] = &[78,139,111];
 const HSV_MAX_RANGE : &'static [i32] = &[114,255,255];
+
+const FRAME_WIDTH : i32 = 320;
+const FRAME_HEIGHT : i32 = 240;
 
 // When checking for whether or not motion has stopped, this is 
 // how many recent points to consider and how small the motion
@@ -328,8 +330,8 @@ fn main() -> Result<()> {
 		return Err(e);
 	}
 
-    cam.set(videoio::CAP_PROP_FRAME_WIDTH, 320.0).unwrap();
-    cam.set(videoio::CAP_PROP_FRAME_HEIGHT, 240.0).unwrap();
+    cam.set(videoio::CAP_PROP_FRAME_WIDTH, FRAME_WIDTH as f64).unwrap();
+    cam.set(videoio::CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT as f64).unwrap();
 
 
 	// Build the model and get the glyph labels
@@ -349,7 +351,7 @@ fn main() -> Result<()> {
 	let mut thresh = Mat::default();
 	let mut frame_count = 0;
 	let mut frame_start = Instant::now();
-	let zeros = Mat::zeros(320, 320,core::CV_8UC3).unwrap();
+	let zeros = Mat::zeros(FRAME_WIDTH, FRAME_HEIGHT,core::CV_8UC3).unwrap();
 	let mut glyph_image : core::Mat = zeros.to_mat().unwrap();
 
 	// HSV color range for threshold
