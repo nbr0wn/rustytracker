@@ -12,6 +12,9 @@ functional, are not particularly straightforward if you don't know the API well 
 implementations out there.  A native rust library probably would have saved me a lot of time, despite not having the 
 history that opencv does. 
 
+![rustytracker](https://user-images.githubusercontent.com/1176032/219705995-7db77c5a-8ac2-434e-b1e9-17fd9427d755.png)
+
+
 # How to use
 
 ```
