@@ -1,6 +1,6 @@
 [package]
 name = "rustytracker"
-version = "0.1.0"
+version = "0.8.0"
 author = "Neil Brown"
 edition = "2021"
 
@@ -9,3 +9,9 @@ clap = { version = "4.1.4", features = ["derive"] }
 opencv = "0.76.4"
 rand = "0.8.5"
 regex = "1.7.1"
+
+
+[features]
+# Comment this out to disable the use of the debug windows.  This will
+# remove the need for GTK-dev on headless builds.
+have_gui = []

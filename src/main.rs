@@ -1,4 +1,8 @@
-use opencv::{highgui, Error, ml, types, imgcodecs, imgproc, core, prelude::*, videoio, Result};
+use opencv::{Error, ml, types, imgcodecs, imgproc, core, prelude::*, videoio, Result};
+
+#[cfg(feature="have_gui")]
+use opencv::highgui;
+
 use std::time::Instant;
 use std::fs;
 use std::collections::HashMap;
@@ -13,15 +17,15 @@ use regex::Regex;
 const IMAGE_DIM:i32 = 20;
 
 // Contours smaller than this will be ignored
-const MIN_CONTOUR_AREA:f64 = 3.0;
+const MIN_CONTOUR_AREA:f64 = 0.1;
 
 // These are the high and low ranges for the inRange threshold function.
 // Use the python tool in the tools directory to generate these values.
 const HSV_MIN_RANGE : &'static [i32] = &[78,139,111];
 const HSV_MAX_RANGE : &'static [i32] = &[114,255,255];
 
-const FRAME_WIDTH : i32 = 320;
-const FRAME_HEIGHT : i32 = 240;
+const FRAME_WIDTH : i32 = 640;
+const FRAME_HEIGHT : i32 = 480;
 
 // When checking for whether or not motion has stopped, this is 
 // how many recent points to consider and how small the motion
@@ -42,6 +46,7 @@ struct Args {
    image_dir: String,
 
    /// Show tracking image windows
+   #[cfg(feature="have_gui")]	
    #[arg(short,long, default_value_t = true)]
    show: bool,
 
@@ -79,24 +84,28 @@ fn check_glyph( knn: &core::Ptr<dyn KNearest>, keypoints : &core::Vector<core::P
 		return Err(Error{code:0, message:"Not enough points".to_string()}); 
 	}
 
-	// Create a 32x32 image - man these rust opencv bindings are annoying
-	// Maybe there's a better way to do this but I couldn't find it
+	// Simplify the keypoint list
+	let mut simplified : core::Vector<core::Point> = core::Vector::default();
+	imgproc::approx_poly_dp(keypoints, &mut simplified, 2.0, false).unwrap();
+
+	// Create a sample IMAGE_DIMxIMAGE_DIM image
 	let zeros = Mat::zeros(IMAGE_DIM, IMAGE_DIM,core::CV_32F).unwrap();
 	let mut dest_image : core::Mat = zeros.to_mat().unwrap();
 
 	// Find the bounds of the keypoints
-	// Start with a 1x1 bounding box 
-	let pt = keypoints.get(0).unwrap();
+	// Start with a 1x1 bounding box and grow it
+	let pt = simplified.get(0).unwrap();
 	let mut bbox = core::Rect::new(pt.x as i32, pt.y as i32, 1, 1);
-	for idx in 1..keypoints.len() {
-		let kp = keypoints.get(idx).unwrap();
+	for idx in 1..simplified.len() {
+		let kp = simplified.get(idx).unwrap();
 		update_bounds(&mut bbox, &kp, 9999);
 	}
 
 	// Figure out the scale factor to draw everything within bounds
 	// into an IMAGE_DIM x IMAGE_DIM image.  Need to take some caer 
-	// here because filling the bounds means you can never have a 
-	// straigh vertical or horizontal line.
+	// here because scaling in X and Y to match the image dimensions
+	// means you can never have a straigh vertical or horizontal line.
+	// as it will get stretched in both dimensions.
 	let mut x_scale = IMAGE_DIM as f32 / bbox.width as f32;
 	let mut y_scale = IMAGE_DIM as f32 / bbox.height as f32;
 	if x_scale < y_scale { y_scale = x_scale; }
@@ -107,8 +116,8 @@ fn check_glyph( knn: &core::Ptr<dyn KNearest>, keypoints : &core::Vector<core::P
 	let origin = core::Point::new( bbox.x, bbox.y);
 
 	// Draw line segments between keypoints into the image 
-	let mut pt1 = scale_point(&origin, keypoints.get(0).unwrap(), scale_factor);
-	for keypt in keypoints.iter().skip(1) {
+	let mut pt1 = scale_point(&origin, simplified.get(0).unwrap(), scale_factor);
+	for keypt in simplified.iter().skip(1) {
 		let pt2 = scale_point(&origin, keypt, scale_factor);
 		
 		imgproc::line(&mut dest_image, pt1, pt2, 
@@ -136,6 +145,7 @@ fn check_glyph( knn: &core::Ptr<dyn KNearest>, keypoints : &core::Vector<core::P
 
 	let res: f32 = *result_idx.at(0).unwrap();
 
+	#[cfg(feature="have_gui")]	
 	if args.show {
 		// Draw the glyph 
 		highgui::imshow("sample", &dest_image).unwrap();
@@ -197,8 +207,10 @@ fn build_model( args: &Args ) -> (core::Ptr<dyn KNearest>, HashMap<u32,String>) 
 		}
 	}
 
+	if glyph_index > 0 {
 	// Train the model with our sample set
 	knn.train( &sample_set, ml::ROW_SAMPLE, &label_set ).unwrap();
+	}
 
 	// Return the goodies
 	(knn,label_hash)
@@ -272,15 +284,18 @@ fn draw_glyph(dest_image: &mut core::Mat, points : &core::Vector<core::Point>) {
 		return;
 	}
 
+	let mut simplified : core::Vector<core::Point> = core::Vector::default();
+	imgproc::approx_poly_dp(points, &mut simplified, 2.0, false).unwrap();
+
 	// Draw the keypoints with connected line segments
-	let mut prev_pt = points.get(0).unwrap();
+	let mut prev_pt = simplified.get(0).unwrap();
 	imgproc::draw_marker(dest_image, prev_pt, 
 			core::VecN([0.0, 0.0, 255.0, 1.0]),
 			imgproc::MARKER_DIAMOND,
 			10,
 			2,
 			imgproc::FILLED).unwrap();
-	for keypt in points.iter().skip(1) {
+	for keypt in simplified.iter().skip(1) {
 		imgproc::draw_marker(dest_image, keypt, 
 				core::VecN([0.0, 0.0, 255.0, 1.0]),
 				imgproc::MARKER_DIAMOND,
@@ -293,10 +308,10 @@ fn draw_glyph(dest_image: &mut core::Mat, points : &core::Vector<core::Point>) {
 		prev_pt = keypt;
 	}
 
-	let pt = points.get(0).unwrap();
+	let pt = simplified.get(0).unwrap();
 	let mut bbox = core::Rect::new(pt.x as i32, pt.y as i32, 1, 1);
-	for idx in 1..points.len() {
-		let kp = points.get(idx).unwrap();
+	for idx in 1..simplified.len() {
+		let kp = simplified.get(idx).unwrap();
 		update_bounds(&mut bbox, &kp, 9999);
 	}
 
@@ -309,29 +324,18 @@ fn main() -> Result<()> {
 	let args = Args::parse();
 
 	let cam_win = "frame";
-	highgui::named_window(cam_win, highgui::WINDOW_AUTOSIZE)?;
-
 	let thresh_win = "threshold";
-	highgui::named_window(thresh_win, highgui::WINDOW_AUTOSIZE)?;
-
 	let glyph_win = "glyph";
-	highgui::named_window(glyph_win, highgui::WINDOW_AUTOSIZE)?;
-
 	let sample_win = "sample";
+
+	#[cfg(feature="have_gui")]	
+	highgui::named_window(cam_win, highgui::WINDOW_AUTOSIZE)?;
+	#[cfg(feature="have_gui")]	
+	highgui::named_window(thresh_win, highgui::WINDOW_AUTOSIZE)?;
+	#[cfg(feature="have_gui")]	
+	highgui::named_window(glyph_win, highgui::WINDOW_AUTOSIZE)?;
+	#[cfg(feature="have_gui")]	
 	highgui::named_window(sample_win, highgui::WINDOW_AUTOSIZE)?;
-
-	let mut cam = match videoio::VideoCapture::new(0, videoio::CAP_ANY) {
-		Ok(cam) => cam,
-		Err(e) => { println!("Error Opening Camera: {}", e); return Err(e);  }
-	};
-
-	if let Err(e) = videoio::VideoCapture::is_opened(&cam) {
-		println!("Error Opening Camera{}", e);
-		return Err(e);
-	}
-
-    cam.set(videoio::CAP_PROP_FRAME_WIDTH, FRAME_WIDTH as f64).unwrap();
-    cam.set(videoio::CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT as f64).unwrap();
 
 
 	// Build the model and get the glyph labels
@@ -360,124 +364,153 @@ fn main() -> Result<()> {
 	let upper_bound = Mat::from_slice(&HSV_MAX_RANGE).unwrap();
 
 	loop {
-		let mut do_glyph_check: bool = false;
 
-		if args.fps {
-			if frame_count == 0 {
-				frame_start = Instant::now();
+		// Camera setup
+		let mut cam = match videoio::VideoCapture::new(0, videoio::CAP_ANY) {
+			Ok(cam) => cam,
+			Err(e) => { 
+				println!("Error Opening Camera: {}", e); 
+				continue; 
 			}
-			frame_count += 1;
-		}
+		};
 
-		// Grab a frame from the camera
-		cam.read(&mut frame)?;
-
-		// If we didn't get a frame, try for another
-		if frame.size()?.width <= 0 {
+		// Try again until we have a real camera
+		if ! videoio::VideoCapture::is_opened(&cam)? {
+			println!("Error Opening Camera");
 			continue;
 		}
 
-		if args.grayscale {
-			// Convert to gray scale
-			imgproc::cvt_color(&frame, &mut gray, imgproc::COLOR_BGR2GRAY, 0).unwrap();
+		cam.set(videoio::CAP_PROP_FRAME_WIDTH, FRAME_WIDTH as f64).unwrap();
+		cam.set(videoio::CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT as f64).unwrap();
 
-			// Do binary thresholding on the gray image
-			imgproc::threshold(&gray, &mut thresh, 100.0, 255.0, imgproc::THRESH_BINARY).unwrap();
-		} else {
-			// Convert frame to hsv
-			imgproc::cvt_color(&frame, &mut hsv, imgproc::COLOR_BGR2HSV, 0).unwrap();
 
-			// Do color thresholding
-			core::in_range(&hsv, &lower_bound, &upper_bound, &mut thresh).unwrap();
-		}
+		loop {
+			let mut do_glyph_check: bool = false;
 
-		// Blur the threshold image - sometimes this is helpful for noisy images
-		//let mut intermediate = Mat::default();
-		//imgproc::blur(&intermediate, &mut thresh, core::Size::new(7,7), core::Point::new(-1,-1), 0).unwrap();
-
-		// Find contours in the thresholded image
-		let mut found_contours = types::VectorOfMat::new(); 
-		imgproc::find_contours(
-			&mut thresh, 
-			&mut found_contours, 
-			imgproc::RETR_EXTERNAL,  // Only the external contours
-			imgproc::CHAIN_APPROX_SIMPLE,  // Only the bounds are stored
-			core::Point::new(0,0)
-		)?;
-
-		// Get the center of the largest contour if there is one
-		if let Some(center_point) = get_max_contour_center(&found_contours) {
-			// Add our keypoint to the list of keypoints
-			all_keypoints.push(center_point);
-			quiet_start = Instant::now();
-
-		} else {
-			// If we haven't seen a point for awhile, attempt a match
-			if quiet_start.elapsed().as_millis() > MOTION_STOPPED_MS && all_keypoints.len() > 2 {
-				println!("No More Points");
-				do_glyph_check = true;
-			}
-		}
-
-		// Get the bounds of the last few points and see if the source is not moving
-		// No need to do this if we already decided that we need to do a glyph check
-		if all_keypoints.len()  > 2 && !do_glyph_check {
-			// We'll use the first point as our bounds start
-			let mut skip: usize =1;
-
-			// Figure out how points we need to skip
-			if all_keypoints.len() > MOTION_STOPPED_WINDOW {
-				skip = all_keypoints.len() - MOTION_STOPPED_WINDOW + 1;
-			} 
-
-			// Init our bounds with the first keypoint
-			let kp = all_keypoints.get(skip-1).unwrap();
-			let mut bounds = core::Rect::new(kp.x, kp.y, 1, 1);
-
-			// Calculate bounding box for the points
-			for (_idx, keypt) in all_keypoints.iter().skip(skip).enumerate() {
-				update_bounds(&mut bounds, &keypt, 9999);
+			if args.fps {
+				if frame_count == 0 {
+					frame_start = Instant::now();
+				}
+				frame_count += 1;
 			}
 
-			// Check area
-			if all_keypoints.len() > 10 && bounds.area() < MOTION_STOPPED_AREA {
-				println!("Area: {}", bounds.area());
-				println!("Not enough motion");
-				do_glyph_check = true;
+			// Grab a frame from the camera
+			cam.read(&mut frame)?;
+
+			// If we didn't get a frame, try for another
+			if frame.size()?.width <= 0 {
+				// Unless the camera is fubar, in which case just break and
+				// go back to the setup loop
+				if ! videoio::VideoCapture::is_opened(&cam)? {
+					println!("Camera Error.  Resetting");
+					break;
+				}
+				continue;
 			}
-		}
 
-		// Show our windows if requested
-		if args.show {
-			glyph_image = zeros.to_mat().unwrap();
-			draw_glyph(&mut glyph_image, &all_keypoints);
+			if args.grayscale {
+				// Convert to gray scale
+				imgproc::cvt_color(&frame, &mut gray, imgproc::COLOR_BGR2GRAY, 0).unwrap();
 
-			highgui::imshow(cam_win, &frame).unwrap();
-			highgui::imshow(thresh_win, &thresh).unwrap();
-			highgui::imshow(glyph_win, &glyph_image).unwrap();
+				// Do binary thresholding on the gray image
+				imgproc::threshold(&gray, &mut thresh, 100.0, 255.0, imgproc::THRESH_BINARY).unwrap();
+			} else {
+				// Convert frame to hsv
+				imgproc::cvt_color(&frame, &mut hsv, imgproc::COLOR_BGR2HSV, 0).unwrap();
 
-			let key = highgui::wait_key(1).unwrap();
-			if key > 0 && key != 255 {
-				return Ok(());
+				// Do color thresholding
+				core::in_range(&hsv, &lower_bound, &upper_bound, &mut thresh).unwrap();
 			}
-		}
 
-		// Time to run our glyph through the model?
-		if do_glyph_check {
-			// Stopped.  Check the image and clear the points
-			if let Ok(result) = check_glyph(&knn, &all_keypoints, &args) {
-				println!("Glyph: {:?}", labels[&result]);
-				let _ = Command::new(format!("{}/{}.sh",args.image_dir,labels[&result]))
-				.output();
+			// Blur the threshold image - sometimes this is helpful for noisy images
+			//let mut intermediate = Mat::default();
+			//imgproc::blur(&intermediate, &mut thresh, core::Size::new(7,7), core::Point::new(-1,-1), 0).unwrap();
+
+			// Find contours in the thresholded image
+			let mut found_contours = types::VectorOfMat::new(); 
+			imgproc::find_contours(
+				&mut thresh, 
+				&mut found_contours, 
+				imgproc::RETR_EXTERNAL,  // Only the external contours
+				imgproc::CHAIN_APPROX_SIMPLE,  // Only the bounds are stored
+				core::Point::new(0,0)
+			)?;
+
+			// Get the center of the largest contour if there is one
+			if let Some(center_point) = get_max_contour_center(&found_contours) {
+				// Add our keypoint to the list of keypoints
+				all_keypoints.push(center_point);
+				quiet_start = Instant::now();
+
+			} else {
+				// If we haven't seen a point for awhile, attempt a match
+				if quiet_start.elapsed().as_millis() > MOTION_STOPPED_MS && all_keypoints.len() > 2 {
+					println!("No More Points");
+					do_glyph_check = true;
+				}
 			}
-			all_keypoints.clear();
-		}
 
-		// Handle fps 
-		if args.fps {
-			if frame_count == 100 {
-				println!("FPS:{}",frame_start.elapsed().as_millis() / 100);
-				frame_count = 0;
+			// Get the bounds of the last few points and see if the source is not moving
+			// No need to do this if we already decided that we need to do a glyph check
+			if all_keypoints.len()  > 2 && !do_glyph_check {
+				// We'll use the first point as our bounds start
+				let mut skip: usize =1;
+
+				// Figure out how points we need to skip
+				if all_keypoints.len() > MOTION_STOPPED_WINDOW {
+					skip = all_keypoints.len() - MOTION_STOPPED_WINDOW + 1;
+				} 
+
+				// Init our bounds with the first keypoint
+				let kp = all_keypoints.get(skip-1).unwrap();
+				let mut bounds = core::Rect::new(kp.x, kp.y, 1, 1);
+
+				// Calculate bounding box for the points
+				for (_idx, keypt) in all_keypoints.iter().skip(skip).enumerate() {
+					update_bounds(&mut bounds, &keypt, 9999);
+				}
+
+				// Check area
+				if all_keypoints.len() > 10 && bounds.area() < MOTION_STOPPED_AREA {
+					println!("Area: {}", bounds.area());
+					println!("Not enough motion");
+					do_glyph_check = true;
+				}
+			}
+
+			// Show our windows if requested
+			#[cfg(feature="have_gui")]	
+			if args.show {
+				glyph_image = zeros.to_mat().unwrap();
+				draw_glyph(&mut glyph_image, &all_keypoints);
+
+				highgui::imshow(cam_win, &frame).unwrap();
+				highgui::imshow(thresh_win, &thresh).unwrap();
+				highgui::imshow(glyph_win, &glyph_image).unwrap();
+
+				let key = highgui::wait_key(1).unwrap();
+				if key > 0 && key != 255 {
+					return Ok(());
+				}
+			}
+
+			// Time to run our glyph through the model?
+			if do_glyph_check {
+				// Stopped.  Check the image and clear the points
+				if let Ok(result) = check_glyph(&knn, &all_keypoints, &args) {
+					println!("Glyph: {:?}", labels[&result]);
+					let _ = Command::new(format!("{}/{}.sh",args.image_dir,labels[&result]))
+					.output();
+				}
+				all_keypoints.clear();
+			}
+
+			// Handle fps 
+			if args.fps {
+				if frame_count == 100 {
+					println!("ms per frame:{}",frame_start.elapsed().as_millis() / 100);
+					frame_count = 0;
+				}
 			}
 		}
 	}
