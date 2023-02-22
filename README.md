@@ -5,12 +5,12 @@ Webcam based object tracking using rust and opencv.
 This is a webcam-based object tracker and glyph recognizer using rust and opencv.  I have wanted to try this for awhile, 
 but I wanted to do it in rust and see if performance was good enough for it to be a useful controller for my home theater.
 After searching around a bit, I found the pi-to-potter project https://github.com/mamacker/pi_to_potter , which I based 
-this project on.  Both projects use openCV for camera interaction, image processing, and the KNearest algorithm to do the image searching. 
+this project on.  Both projects use openCV for camera interaction, image processing, and the KNearest algorithm to do the image searching.  For rustytracker, I added directionality to 
+the glyphs, so a clockwise circle is different from a counter clockwise circle.
 
-I wanted to do this project in rust specifically as an exercise for myself, and I found that the opencv bindings, while
-functional, are not particularly straightforward if you don't know the API well enough to translate from the C++/python
-implementations out there.  A native rust library probably would have saved me a lot of time, despite not having the 
-history that opencv does. 
+I wanted to do this project in rust as an exercise for myself, and I found that the opencv bindings, while
+functional, are not particularly straightforward if you are not already intimately 
+familiar with the API.  A native rust library probably would have saved me a lot of time, despite not having the history that opencv does, but I managed in the end.
 
 ![rustytracker](https://user-images.githubusercontent.com/1176032/219705995-7db77c5a-8ac2-434e-b1e9-17fd9427d755.png)
 
@@ -31,25 +31,24 @@ Options:
 ```
 
 Rustytracker loads all image inside [image-dir] on startup, using [image-dir]/[glyph-dir]/*.png as training images.
-[image-dir]/[glyph-dir].sh is the name of the shell script that is executed when the glyph with that name is detected.
 
 For a directory structure as follows:
 ```
 images/ 
- + circle.sh
+ + glyph.sh
  + circle/
  |  + circle1.png
  |  + circle2.png
  |  + circle3.png
- + square.sh
  + square/
  |  + square1.png
  |  + square2.png
  |  + square3.png
  ```
 
-There are two glyphs, one called circle and one called square, each with three training images and a shell script to 
-execute when the glyph is detected.
+There are two glyphs, one called circle and one called square, each with three training images.
+[image-dir]/glyph.sh is the name of the shell script that is executed on detection with 
+the name of the detected glyph as its only argument.
 
 # Algorithm
 
@@ -61,7 +60,7 @@ Rustytracker isolates the item of interest and then uses the KNearest ml algorit
 - Take the center of each contour as a point in a connected list of glpyh line segments
 - Stop detecting points when a frame is detected with no contours or when the last n contours detected are within some small bounds (object not moving)
 - Determine scale factor to fit points into sample image size
-- Draw connected points as lines into blank sample image
+- Draw connected points as lines into blank sample image with intensity dropping from start to end
 - Submit sample image to KNearest algorithm for comparison
 - Call shell script on successful detection
 

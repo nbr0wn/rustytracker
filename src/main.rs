@@ -37,6 +37,8 @@ const MOTION_STOPPED_AREA:i32 = 100;
 // how many milliseconds to consider
 const MOTION_STOPPED_MS:u128 = 1000;
 
+const SIMPLIFY_FACTOR : f64 = 1.0;
+
 // Command line argument definitions
 #[derive(Parser, Default, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -86,10 +88,11 @@ fn check_glyph( knn: &core::Ptr<dyn KNearest>, keypoints : &core::Vector<core::P
 
 	// Simplify the keypoint list
 	let mut simplified : core::Vector<core::Point> = core::Vector::default();
-	imgproc::approx_poly_dp(keypoints, &mut simplified, 2.0, false).unwrap();
+	imgproc::approx_poly_dp(keypoints, &mut simplified, SIMPLIFY_FACTOR, false).unwrap();
 
 	// Create a sample IMAGE_DIMxIMAGE_DIM image
 	let zeros = Mat::zeros(IMAGE_DIM, IMAGE_DIM,core::CV_32F).unwrap();
+	let mut directional : core::Mat = zeros.to_mat().unwrap();
 	let mut dest_image : core::Mat = zeros.to_mat().unwrap();
 
 	// Find the bounds of the keypoints
@@ -106,24 +109,40 @@ fn check_glyph( knn: &core::Ptr<dyn KNearest>, keypoints : &core::Vector<core::P
 	// here because scaling in X and Y to match the image dimensions
 	// means you can never have a straigh vertical or horizontal line.
 	// as it will get stretched in both dimensions.
+
+	// Default to scaling in both dimensions
 	let mut x_scale = IMAGE_DIM as f32 / bbox.width as f32;
 	let mut y_scale = IMAGE_DIM as f32 / bbox.height as f32;
-	if x_scale < y_scale { y_scale = x_scale; }
-	if y_scale < x_scale { x_scale = y_scale; }
+
+	// If the glyph is much larger in X or Y then preserve aspect ratio
+	if bbox.width < bbox.height / 2 || bbox.height < bbox.width / 2 {
+		if x_scale < y_scale { y_scale = x_scale; }
+		if y_scale < x_scale { x_scale = y_scale; }
+	}
+
 	let scale_factor : core::Point2f = core::Point2f::new( x_scale, y_scale );
 	
 	// Get the top left corner of the bounding box
 	let origin = core::Point::new( bbox.x, bbox.y);
+
+	let mut color_val = 1.0;
+	let color_delta = 0.9 / (simplified.len() - 1) as f64;
 
 	// Draw line segments between keypoints into the image 
 	let mut pt1 = scale_point(&origin, simplified.get(0).unwrap(), scale_factor);
 	for keypt in simplified.iter().skip(1) {
 		let pt2 = scale_point(&origin, keypt, scale_factor);
 		
+		imgproc::line(&mut directional, pt1, pt2, 
+			core::VecN([color_val, 0.0, 0.0, 0.0]),
+			2, 0, 0).unwrap();
+
 		imgproc::line(&mut dest_image, pt1, pt2, 
-			core::VecN([255.0, 255.0, 255.0, 1.0]), 2, 0, 0).unwrap();
+			core::VecN([1.0, 0.0, 0.0, 0.0]),
+			2, 0, 0).unwrap();
 
 		pt1 = pt2;
+		color_val -= color_delta;
 	}
 
 	// Pass the image into the knn classifier
@@ -277,6 +296,7 @@ fn get_max_contour_center( contours: &types::VectorOfMat ) -> Option<core::Point
 	None
 }
 
+#[cfg(feature="have_gui")]	
 fn draw_glyph(dest_image: &mut core::Mat, points : &core::Vector<core::Point>) {
 
 	// Don't bother if we don't have enough points
@@ -285,16 +305,24 @@ fn draw_glyph(dest_image: &mut core::Mat, points : &core::Vector<core::Point>) {
 	}
 
 	let mut simplified : core::Vector<core::Point> = core::Vector::default();
-	imgproc::approx_poly_dp(points, &mut simplified, 2.0, false).unwrap();
+	imgproc::approx_poly_dp(points, &mut simplified, SIMPLIFY_FACTOR, false).unwrap();
 
-	// Draw the keypoints with connected line segments
+	println!("Simplifying {} -> {} points", points.len(), simplified.len());
+
+	// Draw the keypoints with connected line segments in decreasing 
+	// intensity
 	let mut prev_pt = simplified.get(0).unwrap();
+
 	imgproc::draw_marker(dest_image, prev_pt, 
 			core::VecN([0.0, 0.0, 255.0, 1.0]),
 			imgproc::MARKER_DIAMOND,
 			10,
 			2,
 			imgproc::FILLED).unwrap();
+
+	let mut color_val = 255.0;
+	let color_delta = 128.0 / (simplified.len() - 1) as f64;
+
 	for keypt in simplified.iter().skip(1) {
 		imgproc::draw_marker(dest_image, keypt, 
 				core::VecN([0.0, 0.0, 255.0, 1.0]),
@@ -302,12 +330,15 @@ fn draw_glyph(dest_image: &mut core::Mat, points : &core::Vector<core::Point>) {
 				10,
 				2,
 				imgproc::FILLED).unwrap();
+			
 		imgproc::line(dest_image, prev_pt, keypt, 
-			core::VecN([0.0, 255.0, 255.0, 1.0]), 2, 0, 0).unwrap();
+			core::VecN([color_val, color_val, color_val, 1.0]), 2, 0, 0).unwrap();
 
 		prev_pt = keypt;
+		color_val -= color_delta;
 	}
 
+	// Get bounding box
 	let pt = simplified.get(0).unwrap();
 	let mut bbox = core::Rect::new(pt.x as i32, pt.y as i32, 1, 1);
 	for idx in 1..simplified.len() {
@@ -315,6 +346,7 @@ fn draw_glyph(dest_image: &mut core::Mat, points : &core::Vector<core::Point>) {
 		update_bounds(&mut bbox, &kp, 9999);
 	}
 
+	// Draw it
 	imgproc::rectangle(dest_image, bbox,
 		core::VecN([0.0, 255.0, 255.0, 1.0]), 2, 0, 0).unwrap();
 }
@@ -323,9 +355,14 @@ fn main() -> Result<()> {
 
 	let args = Args::parse();
 
+	// It's annoying to have to do it this way
+	#[cfg(feature="have_gui")]	
 	let cam_win = "frame";
+	#[cfg(feature="have_gui")]	
 	let thresh_win = "threshold";
+	#[cfg(feature="have_gui")]	
 	let glyph_win = "glyph";
+	#[cfg(feature="have_gui")]	
 	let sample_win = "sample";
 
 	#[cfg(feature="have_gui")]	
@@ -336,6 +373,10 @@ fn main() -> Result<()> {
 	highgui::named_window(glyph_win, highgui::WINDOW_AUTOSIZE)?;
 	#[cfg(feature="have_gui")]	
 	highgui::named_window(sample_win, highgui::WINDOW_AUTOSIZE)?;
+	#[cfg(feature="have_gui")]	
+	let zeros = Mat::zeros(FRAME_WIDTH, FRAME_HEIGHT,core::CV_8UC3).unwrap();
+	#[cfg(feature="have_gui")]	
+	let mut glyph_image : core::Mat = zeros.to_mat().unwrap();
 
 
 	// Build the model and get the glyph labels
@@ -355,8 +396,6 @@ fn main() -> Result<()> {
 	let mut thresh = Mat::default();
 	let mut frame_count = 0;
 	let mut frame_start = Instant::now();
-	let zeros = Mat::zeros(FRAME_WIDTH, FRAME_HEIGHT,core::CV_8UC3).unwrap();
-	let mut glyph_image : core::Mat = zeros.to_mat().unwrap();
 
 	// HSV color range for threshold
 	let mut hsv = Mat::default();
@@ -499,7 +538,8 @@ fn main() -> Result<()> {
 				// Stopped.  Check the image and clear the points
 				if let Ok(result) = check_glyph(&knn, &all_keypoints, &args) {
 					println!("Glyph: {:?}", labels[&result]);
-					let _ = Command::new(format!("{}/{}.sh",args.image_dir,labels[&result]))
+					let _ = Command::new(format!("{}/glyph.sh",args.image_dir))
+					.arg(format!("{}",labels[&result]))
 					.output();
 				}
 				all_keypoints.clear();
